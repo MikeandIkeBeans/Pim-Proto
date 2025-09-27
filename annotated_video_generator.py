@@ -154,7 +154,7 @@ class MockModel:
         return torch.randn(batch_size, num_classes)
 
 class AnnotatedVideoGenerator:
-    def __init__(self, model_path="models/pim_model_joint_bone.pth", 
+    def __init__(self, model_path=None, 
                  confidence_threshold=0.7, sequence_length=30, use_ensemble=False):
         """
         Initialize the annotated video generator
@@ -170,11 +170,13 @@ class AnnotatedVideoGenerator:
         self.use_ensemble = use_ensemble
         
         # Load the trained model(s)
-        print(f"Loading model from: {model_path}")
+        print(f"Loading model from: {model_path if model_path else 'ensemble mode'}")
         if MEDIAPIPE_AVAILABLE:
             if use_ensemble:
-                self.model, self.movements, self.model_type = self._load_ensemble_models(model_path)
+                self.model, self.movements, self.model_type = self._load_ensemble_models()
             else:
+                if model_path is None:
+                    raise ValueError("model_path must be provided when use_ensemble=False")
                 self.model, self.movements, self.model_type = load_trained_model(model_path)
                 self.model.eval()
         else:
@@ -224,53 +226,89 @@ class AnnotatedVideoGenerator:
         else:
             self.processor = MockMultiViewPIMProcessor(num_views=3)
     
-    def _load_ensemble_models(self, config_path):
-        """Load ensemble models for voting"""
+    def _load_ensemble_models(self, config_path=None):
+        """Load ensemble models for voting - comprehensive ensemble like model_comparison_demo"""
         from concurrent.futures import ThreadPoolExecutor
         import torch
         
-        # Load ensemble configuration
-        config = torch.load(config_path)
-        ensemble_models = []
-        movements = config['movement_classes']
+        # Define model configs like in model_comparison_demo.py
+        model_configs = {
+            'joint_bone': {
+                'path': 'models/pim_model_joint_bone.pth',
+                'description': 'Joint-Bone Ensemble LSTM (Advanced)'
+            },
+            'ensemble_0': {
+                'path': 'models/ensemble/ensemble_model_0.pth',
+                'description': 'Ensemble Model 0'
+            },
+            'ensemble_1': {
+                'path': 'models/ensemble/ensemble_model_1.pth',
+                'description': 'Ensemble Model 1'
+            },
+            'ensemble_2': {
+                'path': 'models/ensemble/ensemble_model_2.pth',
+                'description': 'Ensemble Model 2'
+            },
+            'stgcn_0': {
+                'path': 'models/ensemble/ensemble_model_stgcn_0.pth',
+                'description': 'ST-GCN Ensemble Model 0'
+            },
+            'stgcn_1': {
+                'path': 'models/ensemble/ensemble_model_stgcn_1.pth',
+                'description': 'ST-GCN Ensemble Model 1'
+            },
+            'stgcn_full': {
+                'path': 'models/stgcn_full_comprehensive.pth',
+                'description': 'ST-GCN Full Comprehensive Model (All Data)'
+            }
+        }
         
-        # Load all ensemble models
-        model_paths = config['model_paths']
-        for model_path in model_paths:
-            if os.path.exists(model_path):
-                try:
-                    checkpoint = torch.load(model_path)
-                    
-                    # Handle different model formats
-                    if 'state_dict' in checkpoint:
-                        # STGCN or ensemble model format
-                        model_type = checkpoint.get('architecture', 'unknown').lower()
+        ensemble_models = []
+        ensemble_movements = None
+        
+        # Load joint-bone ensemble models
+        for i in range(3):
+            ensemble_name = f'ensemble_{i}'
+            if ensemble_name in model_configs:
+                ensemble_config = model_configs[ensemble_name]
+                if os.path.exists(ensemble_config['path']):
+                    try:
+                        checkpoint = torch.load(ensemble_config['path'])
                         
-                        if 'stgcn' in model_type:
-                            from stgcn_model import STGCNTwoStream
-                            from stgcn_graph import build_partitions
-                            A = build_partitions()
-                            model = STGCNTwoStream(num_classes=len(movements), A=A)
-                        else:
-                            # Assume joint bone ensemble
-                            from mediapipe_processor import JointBoneEnsembleLSTM
-                            model = JointBoneEnsembleLSTM(num_classes=len(movements))
+                        movements = checkpoint['classes']
+                        if ensemble_movements is None:
+                            ensemble_movements = movements
                         
+                        from mediapipe_processor import JointBoneEnsembleLSTM
+                        model = JointBoneEnsembleLSTM(num_classes=len(movements))
                         model.load_state_dict(checkpoint['state_dict'])
                         
-                    elif 'model_state_dict' in checkpoint:
-                        # STGCN comprehensive format
-                        from stgcn_model import STGCNTwoStream
-                        from stgcn_graph import build_partitions
-                        A = build_partitions()
-                        model = STGCNTwoStream(num_classes=len(movements), A=A)
-                        model.load_state_dict(checkpoint['model_state_dict'])
+                        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                        model.to(device)
+                        model.eval()
                         
-                    else:
-                        print(f"Unknown model format in {model_path}, skipping")
+                        ensemble_models.append({
+                            'model': model,
+                            'model_type': 'jointboneensemblelstm',
+                            'device': device
+                        })
+                        
+                        print(f"✅ Loaded joint-bone ensemble model: {ensemble_name}")
+                        
+                    except Exception as e:
+                        print(f"❌ Failed to load {ensemble_name}: {e}")
                         continue
+        
+        # Load the joint_bone model if available
+        if 'joint_bone' in model_configs:
+            joint_bone_config = model_configs['joint_bone']
+            if os.path.exists(joint_bone_config['path']):
+                try:
+                    model, movements, model_type = load_trained_model(joint_bone_config['path'])
                     
-                    # Move to device
+                    if ensemble_movements is None:
+                        ensemble_movements = movements
+                    
                     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
                     model.to(device)
                     model.eval()
@@ -281,14 +319,89 @@ class AnnotatedVideoGenerator:
                         'device': device
                     })
                     
-                    print(f"✅ Loaded ensemble model: {os.path.basename(model_path)}")
+                    print(f"✅ Loaded joint-bone model")
                     
                 except Exception as e:
-                    print(f"❌ Failed to load {model_path}: {e}")
-                    continue
+                    print(f"❌ Failed to load joint_bone: {e}")
+        
+        # Load ST-GCN ensemble models (excluding stgcn_2 due to chorea bias)
+        for i in range(2):  # Only load stgcn_0 and stgcn_1, skip stgcn_2
+            stgcn_name = f'stgcn_{i}'
+            if stgcn_name in model_configs:
+                stgcn_config = model_configs[stgcn_name]
+                if os.path.exists(stgcn_config['path']):
+                    try:
+                        checkpoint = torch.load(stgcn_config['path'])
+                        
+                        movements = checkpoint['classes']
+                        if ensemble_movements is None:
+                            ensemble_movements = movements
+                        
+                        from stgcn_model import STGCNTwoStream
+                        from stgcn_graph import build_partitions
+                        A = build_partitions()
+                        model = STGCNTwoStream(num_classes=len(movements), A=A)
+                        model.load_state_dict(checkpoint['state_dict'])
+                        
+                        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                        model.to(device)
+                        model.eval()
+                        
+                        ensemble_models.append({
+                            'model': model,
+                            'model_type': 'stgcntwostream',
+                            'device': device
+                        })
+                        
+                        print(f"✅ Loaded ST-GCN ensemble model: {stgcn_name}")
+                        
+                    except Exception as e:
+                        print(f"❌ Failed to load {stgcn_name}: {e}")
+                        continue
+        
+        # Load comprehensive ST-GCN model
+        if 'stgcn_full' in model_configs:
+            stgcn_config = model_configs['stgcn_full']
+            if os.path.exists(stgcn_config['path']):
+                try:
+                    checkpoint = torch.load(stgcn_config['path'])
+                    
+                    movements = checkpoint['classes']
+                    if ensemble_movements is None:
+                        ensemble_movements = movements
+                    
+                    from stgcn_model import STGCNTwoStream
+                    from stgcn_graph import build_partitions
+                    A = build_partitions()
+                    model = STGCNTwoStream(num_classes=len(movements), A=A)
+                    # Handle different checkpoint formats
+                    if 'model_state_dict' in checkpoint:
+                        model.load_state_dict(checkpoint['model_state_dict'])
+                    elif 'state_dict' in checkpoint:
+                        model.load_state_dict(checkpoint['state_dict'])
+                    else:
+                        raise KeyError("Checkpoint missing state_dict or model_state_dict")
+                    
+                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                    model.to(device)
+                    model.eval()
+                    
+                    ensemble_models.append({
+                        'model': model,
+                        'model_type': 'stgcntwostream',
+                        'device': device
+                    })
+                    
+                    print(f"✅ Loaded ST-GCN full comprehensive model")
+                    
+                except Exception as e:
+                    print(f"❌ Failed to load stgcn_full: {e}")
+        
+        if not ensemble_models:
+            raise ValueError("No ensemble models could be loaded!")
         
         print(f"🎯 Ensemble loaded: {len(ensemble_models)} models")
-        return ensemble_models, movements, 'ensemble_voting'
+        return ensemble_models, ensemble_movements, 'ensemble_voting'
     
     def _predict_ensemble_voting(self, frame_buffer):
         """Predict using ensemble voting across all models"""
@@ -485,7 +598,7 @@ class AnnotatedVideoGenerator:
                 end_y = int(end_point[1] * height)
                 
                 # Draw line
-                cv2.line(frame, (start_x, start_y), (end_x, end_y), (255, 255, 255), 2)
+                cv2.line(frame, (start_x, start_y), (end_x, end_y), (0, 255, 0), 3)
         
         # Draw landmarks
         for i, landmark in enumerate(landmarks):
@@ -500,7 +613,7 @@ class AnnotatedVideoGenerator:
             else:  # Legs and torso
                 color = (0, 255, 0)  # Green
             
-            cv2.circle(frame, (x, y), 4, color, -1)
+            cv2.circle(frame, (x, y), 6, color, -1)
         
         return frame
     
@@ -663,15 +776,15 @@ class AnnotatedVideoGenerator:
                 # Create annotated frame - use cropped frame for multi-view
                 annotated_frame = cropped_frame.copy()
                 
-                # Draw pose skeleton if pose detected
-                if pose_detected:
-                    annotated_frame = self.draw_pose_skeleton(annotated_frame, landmarks)
-                
-                # Add text overlay
+                # Add text overlay first
                 annotated_frame = self.create_overlay_text(
                     annotated_frame, current_prediction, current_confidence, 
                     timestamp, current_frame_num, detection_history, pose_detected
                 )
+                
+                # Draw pose skeleton on top if pose detected
+                if pose_detected:
+                    annotated_frame = self.draw_pose_skeleton(annotated_frame, landmarks)
                 
                 # Write frame to output video
                 out.write(annotated_frame)
@@ -961,7 +1074,7 @@ if __name__ == "__main__":
     
     try:
         generator = AnnotatedVideoGenerator(
-            model_path=ensemble_config,
+            model_path=None,  # Not used for ensemble mode
             confidence_threshold=0.7,
             sequence_length=30,
             use_ensemble=True
