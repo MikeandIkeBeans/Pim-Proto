@@ -1,0 +1,43 @@
+# MediaPipe Video Landmark Extraction Requirements
+
+# Core video processing and computer vision
+opencv-python>=4.8.0
+mediapipe>=0.10.7  # Works with Python 3.11/3.12
+
+# Data processing and analysis
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+
+# Machine learning frameworks
+# PyTorch for PIM detection models
+torch>=2.0.1
+torchvision>=0.15.2  # Optional for additional vision utilities
+
+# TensorFlow (alternative - uncomment if preferred)
+# tensorflow>=2.13.0
+
+# Scientific computing and visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+scipy>=1.11.0
+
+# Progress bars and utilities
+tqdm>=4.66.0
+
+# Additional ML utilities
+scikit-learn>=1.3.0
+
+# Development and testing (optional)
+pytest>=7.4.0
+jupyter>=1.0.0
+
+# Optional: For advanced video processing
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.8
+
+# NOTE: This project now includes:
+# - Multi-view video processing (4-view to 3-view cropping)
+# - Advanced PIM (Patient Involuntary Movement) detection
+# - PyTorch-based LSTM neural networks
+# - Real-time movement classification
