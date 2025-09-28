@@ -21,7 +21,7 @@ Model Types:
 - "joint_bone": Joint-Bone ensemble LSTM
 
 Data Format:
-- Expects CSV files in U:\pose_data\ directory
+- Expects CSV files in pose_data directory
 - Filenames should start with movement type (e.g., "normal_001_data.csv")
 - Sequence parameters: 30 frames with 10-frame overlap for data augmentation
 - Supported movements: normal, decorticate, dystonia, chorea, myoclonus,
@@ -42,10 +42,128 @@ import os
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score
 import matplotlib.pyplot as plt
-from pim_detection_system import PIMDatasetLSTM, PIMDetectorLSTM, JointBoneEnsembleLSTM
+from mediapipe_processor import PIMDetectorLSTM, JointBoneEnsembleLSTM, PIM_MOVEMENTS
 import time
 from torch.cuda.amp import GradScaler, autocast
 import torch.optim.lr_scheduler as lr_scheduler
+from pathlib import Path
+import json
+from functools import lru_cache
+
+# Optimized data preprocessing and loading for reduced I/O overhead
+DATA_DIR = Path("pose_data")
+WIN = 30  # sequence length
+STRIDE = 10  # overlap stride
+
+def csv_to_npy(csv_path: Path, out_path: Path):
+    """Convert CSV to .npy format for faster loading"""
+    df = pd.read_csv(csv_path, dtype={'timestamp': 'float32', 'landmark_id': 'int8',
+                                     'x': 'float32', 'y': 'float32', 'z': 'float32'})
+    np.save(out_path, df.to_numpy(dtype=np.float32), allow_pickle=False)
+
+def preprocess_all_csvs(data_dir="pose_data"):
+    """One-time preprocessing: convert all CSVs to .npy"""
+    data_path = Path(data_dir)
+    csvs = list(data_path.glob("*_data.csv"))
+
+    print(f"🔄 Preprocessing {len(csvs)} CSV files to .npy format...")
+
+    for i, csv_path in enumerate(csvs):
+        if i % 100 == 0:
+            print(f"  Processed {i}/{len(csvs)} files...")
+
+        npy_path = csv_path.with_suffix(".npy")
+        if not npy_path.exists():
+            try:
+                csv_to_npy(csv_path, npy_path)
+            except Exception as e:
+                print(f"Error processing {csv_path}: {e}")
+
+    print("✅ Preprocessing complete!")
+
+def build_split_and_index(files, split_ratio=0.8, seed=42, win=30, stride=10):
+    """Build train/val splits and pre-computed index of sequence windows"""
+    rng = np.random.default_rng(seed)
+    files = sorted(files)
+    rng.shuffle(files)
+    n_train = int(len(files) * split_ratio)
+    train_files, val_files = files[:n_train], files[n_train:]
+
+    def make_index(file_list):
+        index = []
+        for f in file_list:
+            npy_path = f.with_suffix(".npy")
+            if npy_path.exists():
+                arr = np.load(npy_path, mmap_mode='r')
+                n_frames = arr.shape[0]
+                for s in range(0, max(0, n_frames - win + 1), stride):
+                    index.append([str(npy_path), s])
+        return index
+
+    return train_files, val_files, make_index(train_files), make_index(val_files)
+
+class PoseDataset(Dataset):
+    """Optimized dataset with memory mapping and pre-built index for minimal I/O"""
+
+    def __init__(self, index_path, movement_classes=None):
+        if movement_classes is None:
+            self.movement_classes = [
+                'normal', 'decorticate', 'dystonia', 'chorea', 'myoclonus',
+                'decerebrate', 'fencer posture', 'ballistic', 'tremor', 'versive head'
+            ]
+        else:
+            self.movement_classes = movement_classes
+
+        self.items = json.loads(Path(index_path).read_text())
+
+    @lru_cache(maxsize=256)
+    def _open(self, npy_path):
+        """Memory map the .npy file for efficient access"""
+        return np.load(npy_path, mmap_mode='r')
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, i):
+        npy_path, start = self.items[i]
+        arr = self._open(npy_path)
+
+        # Extract sequence window
+        x = arr[start:start+WIN]  # [WIN, 5] - timestamp, landmark_id, x, y, z
+
+        # Convert to pose format [WIN, 33, 3]
+        sequence = np.zeros((WIN, 33, 3), dtype=np.float32)
+        for t_idx in range(WIN):
+            if t_idx < len(x):
+                row = x[t_idx]
+                landmark_id = int(row[1])  # landmark_id column
+                if 0 <= landmark_id < 33:
+                    sequence[t_idx, landmark_id, 0] = row[2]  # x
+                    sequence[t_idx, landmark_id, 1] = row[3]  # y
+                    sequence[t_idx, landmark_id, 2] = row[4]  # z
+
+        x = torch.from_numpy(sequence)
+
+        # Extract label from filename
+        y = self._label_from_path(npy_path)
+        return x, y
+
+    def _label_from_path(self, p: str):
+        """Parse movement type from filename"""
+        name = Path(p).name
+        label_str = name.split("_", 1)[0]
+
+        # Handle multi-word movement names
+        if label_str == "fencer":
+            label_str = "fencer posture"
+        elif label_str == "versive":
+            label_str = "versive head"
+
+        try:
+            return torch.tensor(self.movement_classes.index(label_str), dtype=torch.long)
+        except ValueError:
+            # Unknown movement, default to 0
+            return torch.tensor(0, dtype=torch.long)
 
 class LSTMTrainer:
     """Enhanced trainer for LSTM-based PIM detection with pre-cached data loading"""
@@ -100,58 +218,48 @@ class LSTMTrainer:
             print(f"🎮 GPU Memory: {gpu_memory:.1f} GB")
             print(f"🚀 Mixed precision training + enhanced optimizations enabled")
 
-    def load_all_data(self, data_dir=r"U:\pose_data"):
-        """Load ALL training data from the pose_data directory"""
+    def load_all_data(self, data_dir="pose_data"):
+        """Load ALL training data using optimized preprocessing and memory mapping"""
         print(f"📂 Loading ALL training data from {data_dir} directory...")
 
-        all_files = []
-        all_labels = []
+        data_path = Path(data_dir)
 
-        if not os.path.exists(data_dir):
-            raise FileNotFoundError(f"Data directory not found at {data_dir}")
+        # Preprocess CSVs to .npy if needed
+        preprocess_all_csvs(data_dir)
 
-        # Get all CSV files
-        csv_files = [f for f in os.listdir(data_dir) if f.endswith('_data.csv')]
+        # Get all .npy files
+        npy_files = list(data_path.glob("*_data.npy"))
 
-        for csv_file in csv_files:
-            file_path = os.path.join(data_dir, csv_file)
+        if len(npy_files) == 0:
+            raise ValueError(f"No .npy files found! Check {data_dir} directory.")
 
-            # Parse movement type from filename (first part before first underscore)
-            movement = csv_file.split('_')[0]
+        print(f"📊 Found {len(npy_files)} preprocessed .npy files")
 
-            if movement in self.movement_classes:
-                movement_idx = self.movement_classes.index(movement)
-                all_files.append(file_path)
-                all_labels.append(movement_idx)
-            else:
-                print(f"⚠️  Unknown movement type: {movement} in file {csv_file}")
-
-        # Count files per movement
-        for movement_idx, movement in enumerate(self.movement_classes):
-            count = all_labels.count(movement_idx)
-            print(f"  ✅ {movement}: {count} files")
-
-        print(f"📊 Total files loaded: {len(all_files)}")
-
-        if len(all_files) == 0:
-            raise ValueError(f"No training files found! Check {data_dir} directory.")
-
-        # Split into train/val
-        train_files, val_files, train_labels, val_labels = train_test_split(
-            all_files, all_labels, test_size=0.2, random_state=42, stratify=all_labels
+        # Build train/val splits and indices
+        train_files, val_files, train_idx, val_idx = build_split_and_index(
+            [p.with_suffix("") for p in npy_files],  # Remove .npy extension for build_split_and_index
+            split_ratio=0.8, seed=42, win=WIN, stride=STRIDE
         )
 
-        print(f"🎯 Train: {len(train_files)} files, Val: {len(val_files)} files")
+        # Save indices for reuse
+        Path("train_index.json").write_text(json.dumps(train_idx))
+        Path("val_index.json").write_text(json.dumps(val_idx))
 
-        # Create datasets (pre-cached loading)
-        train_dataset = PIMDatasetLSTM(train_files, train_labels, seq_length=30, overlap=10)
-        val_dataset = PIMDatasetLSTM(val_files, val_labels, seq_length=30, overlap=10)
+        print(f"🎯 Train: {len(train_idx)} sequences, Val: {len(val_idx)} sequences")
 
-        # Create data loaders (data is pre-cached, so minimal workers needed)
-        train_loader = DataLoader(train_dataset, batch_size=self.batch_size,
-                                shuffle=True, num_workers=0, pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=self.batch_size,
-                              shuffle=False, num_workers=0, pin_memory=True)
+        # Create optimized datasets
+        train_dataset = PoseDataset("train_index.json", self.movement_classes)
+        val_dataset = PoseDataset("val_index.json", self.movement_classes)
+
+        # Create optimized data loaders with memory mapping
+        train_loader = DataLoader(
+            train_dataset, batch_size=self.batch_size, shuffle=True,
+            num_workers=4, pin_memory=True, prefetch_factor=2, persistent_workers=True
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=self.batch_size, shuffle=False,
+            num_workers=2, pin_memory=True, prefetch_factor=2, persistent_workers=True
+        )
 
         return train_loader, val_loader
 
@@ -367,6 +475,6 @@ class LSTMTrainer:
 if __name__ == "__main__":
     # Train enhanced LSTM model
     trainer = LSTMTrainer(num_classes=10, learning_rate=0.001, batch_size=32, weight_decay=1e-4, model_type="normal")
-    history = trainer.train(num_epochs=100, save_path='models/lstm_enhanced_model.pth', data_dir=r"U:\pose_data")
+    history = trainer.train(num_epochs=100, save_path='models/lstm_enhanced_model.pth', data_dir="pose_data")
     trainer.plot_training_history(history)
     trainer.save_model('models/lstm_enhanced_model.pth')

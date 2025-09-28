@@ -18,8 +18,6 @@ import collections
 import argparse
 import json
 import glob
-from torch.utils.data import Dataset, DataLoader
-import psutil
 from datetime import datetime
 from tqdm import tqdm
 from pathlib import Path
@@ -172,11 +170,14 @@ def train_model(data_dir="pose_data", movements=None, epochs=50, model_type="nor
         movements = set()
         for filename in os.listdir(data_dir):
             if filename.endswith('_data.csv'):
-                # Check if filename starts with any known movement
-                for movement in PIM_MOVEMENTS:
-                    if filename.startswith(movement + '_'):
+                parts = filename.split('_')
+                if parts[-1] == "data.csv":
+                    if len(parts) == 2: 
+                        movement = parts[0]
+                    else: 
+                        movement = '_'.join(parts[:-3])
+                    if movement in PIM_MOVEMENTS:
                         movements.add(movement)
-                        break
         movements = list(movements)
 
     print(f"Training model on movements: {movements}\nModel type: {model_type}")
@@ -192,34 +193,62 @@ def train_model(data_dir="pose_data", movements=None, epochs=50, model_type="nor
             continue
 
         print(f"Found {len(movement_files)} files for movement: {movement}")
-        for file in movement_files:
-            all_files.append(os.path.join(data_dir, file))
-            all_labels.append(idx)
 
-    if not all_files:
+        # Convert to full paths
+        movement_file_paths = [os.path.join(data_dir, f) for f in movement_files]
+
+        # Use optimized batch processing with fallback
+        try:
+            batch_sequences = prepare_sequences_batch(movement_file_paths, seq_length=30, overlap=15)
+            total_sequences = 0
+            for file_idx, sequences in enumerate(batch_sequences):
+                if sequences is not None and len(sequences) > 0:
+                    X.append(sequences)
+                    y.extend([idx] * len(sequences))
+                    total_sequences += len(sequences)
+                    print(f"  - {movement_files[file_idx]}: {len(sequences)} sequences")
+                else:
+                    print(f"  - {movement_files[file_idx]}: No valid sequences extracted")
+        except Exception as e:
+            print(f"Batch processing failed for {movement}, falling back to sequential: {e}")
+            # Fallback to original method
+            for file in movement_files:
+                sequences = prepare_sequences(os.path.join(data_dir, file))
+                if len(sequences) > 0:
+                    X.append(sequences)
+                    y.extend([idx] * len(sequences))
+                    print(f"  - {file}: {len(sequences)} sequences")
+                else:
+                    print(f"  - {file}: No valid sequences extracted")
+
+    if not X:
         print("Error: No valid training data found")
         return None
 
-    print(f"Total files: {len(all_files)}")
+    X = np.vstack(X).astype(np.float32)
+    y = np.asarray(y, dtype=np.int64)
+    print(f"Total sequences: {len(X)}, Shape: {X.shape}")
 
-    # Create dataset (this will pre-load all data into memory)
-    dataset = PIMDatasetLSTM(all_files, all_labels)
-    
-    # Split into train/val datasets
-    total_samples = len(dataset)
-    train_size = int(0.8 * total_samples)
-    val_size = total_samples - train_size
-    
-    # Use random_split for datasets
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
-    )
-    
-    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+    # Convert to tensors
+    X = torch.from_numpy(X).float()
+    y = torch.from_numpy(y).long()
 
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+
+    # Stratified split on indices to keep dtype controlled
+    idx = np.arange(len(X))
+    try:
+        train_idx, test_idx = train_test_split(
+            idx, test_size=0.2, random_state=42, stratify=y.numpy()
+        )
+    except Exception:
+        # Fallback if classes are too small for stratify
+        train_idx, test_idx = train_test_split(idx, test_size=0.2, random_state=42)
+
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
 
     # Initialize model
     model = JointBoneEnsembleLSTM(input_dim=3, hidden_dim=128, num_layers=3, num_classes=len(movements)) \
@@ -228,18 +257,12 @@ def train_model(data_dir="pose_data", movements=None, epochs=50, model_type="nor
     model.to(device)
 
     # Handle tiny datasets gracefully
-    if len(train_dataset) == 0 or len(val_dataset) == 0:
+    if len(X_train) == 0 or len(X_test) == 0:
         print("Error: Not enough data to split train/test. Record more samples.")
         return None
 
-    batch_size = max(1, min(32, len(train_dataset)))  # Increased batch size for better GPU utilization
+    batch_size = max(1, min(16, len(X_train)))
     print(f"Model has {sum(p.numel() for p in model.parameters()):,} parameters")
-
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
-                            num_workers=0, pin_memory=True, persistent_workers=False)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                          num_workers=0, pin_memory=True, persistent_workers=False)
 
     # Train
     criterion = nn.CrossEntropyLoss()
@@ -256,8 +279,9 @@ def train_model(data_dir="pose_data", movements=None, epochs=50, model_type="nor
         running_loss = 0.0
         total_seen = 0
 
-        for xb, yb in train_loader:
-            xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+        for i in range(0, len(X_train), batch_size):
+            xb = X_train[i:i+batch_size].to(device, non_blocking=True)
+            yb = y_train[i:i+batch_size].to(device, non_blocking=True)
 
             optimizer.zero_grad()
             logits, _ = model(xb)
@@ -276,8 +300,9 @@ def train_model(data_dir="pose_data", movements=None, epochs=50, model_type="nor
         val_loss = 0.0
         val_total = 0
         with torch.no_grad():
-            for xb, yb in val_loader:
-                xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+            for i in range(0, len(X_test), batch_size):
+                xb = X_test[i:i+batch_size].to(device, non_blocking=True)
+                yb = y_test[i:i+batch_size].to(device, non_blocking=True)
                 logits, _ = model(xb)
                 loss = criterion(logits, yb)
                 val_loss += loss.item() * xb.size(0)
@@ -301,8 +326,9 @@ def train_model(data_dir="pose_data", movements=None, epochs=50, model_type="nor
     model.eval()
     with torch.no_grad():
         correct, total = 0, 0
-        for xb, yb in val_loader:
-            xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+        for i in range(0, len(X_test), batch_size):
+            xb = X_test[i:i+batch_size].to(device, non_blocking=True)
+            yb = y_test[i:i+batch_size].to(device, non_blocking=True)
             logits, _ = model(xb)
             preds = torch.argmax(logits, dim=1)
             correct += (preds == yb).sum().item()

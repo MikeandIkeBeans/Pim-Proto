@@ -56,7 +56,7 @@ class ModelComparisonDemo:
                 
                 # Special handling for comprehensive ST-GCN model
                 if name == 'stgcn_full':
-                    checkpoint = torch.load(config['path'])
+                    checkpoint = torch.load(config['path'], map_location='cpu')
                     
                     movements = checkpoint['classes']
                     
@@ -85,6 +85,43 @@ class ModelComparisonDemo:
                     self.model_info[name] = config
                     
                     print(f"✅ {name}: stgcntwostream model loaded")
+                    print(f"   Classes: {movements}")
+                    continue
+                
+                # Special handling for enhanced ST-GCN model
+                if name == 'stgcn_enhanced':
+                    checkpoint = torch.load(config['path'], map_location='cpu')
+                    
+                    movements = checkpoint['classes']
+                    
+                    from stgcn_model import STGCNTwoStreamEnhanced
+                    from stgcn_graph import build_partitions
+                    A = build_partitions()
+                    
+                    # Use the enhanced architecture that matches the checkpoint
+                    model = STGCNTwoStreamEnhanced(num_classes=len(movements), A=A)
+                    
+                    # Handle different checkpoint formats
+                    if 'model_state_dict' in checkpoint:
+                        model.load_state_dict(checkpoint['model_state_dict'])
+                    elif 'state_dict' in checkpoint:
+                        model.load_state_dict(checkpoint['state_dict'])
+                    else:
+                        raise KeyError("Checkpoint missing state_dict or model_state_dict")
+                    
+                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                    model.to(device)
+                    model.eval()
+                    
+                    self.models[name] = {
+                        'model': model,
+                        'movements': movements,
+                        'model_type': 'stgcntwostreamenhanced',
+                        'device': device
+                    }
+                    self.model_info[name] = config
+                    
+                    print(f"✅ {name}: stgcntwostream enhanced model loaded")
                     print(f"   Classes: {movements}")
                     continue
                 
@@ -509,7 +546,7 @@ class ModelComparisonDemo:
         print(f"\nActive model: {self.active_model}")
         print("Controls:")
         print("  '1': joint_bone | '2': ensemble_0 | '3': ensemble_1 | '4': ensemble_2")
-        print("  '5': stgcn_0    | '6': stgcn_1    | '8': stgcn_full")
+        print("  '5': stgcn_0    | '6': stgcn_1    | '8': stgcn_full  | '9': stgcn_enhanced")
         print("  '7': ENSEMBLE VOTING")
         print("  Note: Ensemble uses 7 models (includes joint_bone + stgcn_full)")
         print("  'q': Quit")
@@ -644,6 +681,8 @@ class ModelComparisonDemo:
                     self.switch_model('stgcn_1')
                 elif key == ord('8') and 'stgcn_full' in self.models:
                     self.switch_model('stgcn_full')
+                elif key == ord('9') and 'stgcn_enhanced' in self.models:
+                    self.switch_model('stgcn_enhanced')
                 elif key == ord('7') and 'ensemble' in self.models:
                     self.switch_model('ensemble')
                 elif key == ord('q'):
@@ -686,6 +725,10 @@ def main():
         'stgcn_full': {
             'path': 'models/stgcn_full_comprehensive.pth',
             'description': 'ST-GCN Full Comprehensive Model (All Data)'
+        },
+        'stgcn_enhanced': {
+            'path': 'models/stgcn_enhanced_model.pth',
+            'description': 'ST-GCN Enhanced Model (Fresh Training)'
         },
         'ensemble': {
             'path': 'ensemble_voting',  # Special marker for ensemble mode
