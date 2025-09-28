@@ -1,3 +1,37 @@
+#!/usr/bin/env python3
+"""
+Enhanced LSTM Training for PIM Detection System
+
+This script provides optimized LSTM training with pre-cached data loading for constant GPU utilization.
+
+Usage:
+    python train_lstm_full.py
+
+Features:
+- Pre-cached dataset loading (no I/O bottlenecks during training)
+- Mixed precision training (FP16/FP32)
+- Advanced optimization (AdamW + weight decay)
+- Cosine annealing learning rate scheduling
+- Early stopping with patience
+- Gradient clipping
+- Comprehensive training history plotting
+
+Model Types:
+- "normal": Standard LSTM architecture
+- "joint_bone": Joint-Bone ensemble LSTM
+
+Data Format:
+- Expects CSV files in U:\pose_data\ directory
+- Filenames should start with movement type (e.g., "normal_001_data.csv")
+- Sequence parameters: 30 frames with 10-frame overlap for data augmentation
+- Supported movements: normal, decorticate, dystonia, chorea, myoclonus,
+  decerebrate, fencer posture, ballistic, tremor, versive head
+
+Output:
+- Trained model saved to models/lstm_enhanced_model.pth
+- Training history plot saved as lstm_enhanced_training_history.png
+"""
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -8,115 +42,40 @@ import os
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score
 import matplotlib.pyplot as plt
-from stgcn_features import sequences_to_stgcn_batches
-from stgcn_graph import build_partitions, mp_edges
-from stgcn_model import STGCNTwoStream
+from pim_detection_system import PIMDatasetLSTM, PIMDetectorLSTM, JointBoneEnsembleLSTM
 import time
 from torch.cuda.amp import GradScaler, autocast
 import torch.optim.lr_scheduler as lr_scheduler
 
-class PIMDataset(Dataset):
-    """Dataset for PIM movement sequences with pre-cached data for constant GPU utilization"""
-    def __init__(self, file_paths, labels, sequence_length=30):
-        self.file_paths = file_paths
-        self.labels = labels
-        self.sequence_length = sequence_length
-        self.edges = mp_edges()
-        
-        print(f"🔄 Pre-loading {len(file_paths)} data files into memory...")
-        self.cached_data = []
-        
-        for i, (file_path, label) in enumerate(zip(file_paths, labels)):
-            if i % 50 == 0:  # More frequent updates
-                print(f"  Loaded {i}/{len(file_paths)} files...")
-            
-            try:
-                # Load CSV data
-                df = pd.read_csv(file_path)
+class LSTMTrainer:
+    """Enhanced trainer for LSTM-based PIM detection with pre-cached data loading"""
 
-                # Group by timestamp and create sequence [T, 33, 3]
-                sequence_data = []
-                timestamps = df['timestamp'].unique()
-
-                for timestamp in timestamps[:self.sequence_length]:
-                    frame_data = df[df['timestamp'] == timestamp]
-                    if len(frame_data) == 33:  # Ensure we have all 33 landmarks
-                        # Sort by landmark_id and extract x,y,z
-                        frame_data = frame_data.sort_values('landmark_id')
-                        landmarks = frame_data[['x', 'y', 'z']].values  # [33, 3]
-                        sequence_data.append(landmarks)
-
-                # Pad or truncate to sequence_length
-                if len(sequence_data) < self.sequence_length:
-                    # Pad with zeros
-                    padding = [np.zeros((33, 3)) for _ in range(self.sequence_length - len(sequence_data))]
-                    sequence_data.extend(padding)
-                else:
-                    sequence_data = sequence_data[:self.sequence_length]
-
-                # Convert to numpy array [T, V, C]
-                sequence_array = np.array(sequence_data)
-
-                # Convert to ST-GCN format using sequences_to_stgcn_batches
-                Xj, Xb = sequences_to_stgcn_batches([sequence_array], self.edges)
-
-                # Cache the processed tensors
-                self.cached_data.append((
-                    torch.tensor(Xj[0], dtype=torch.float32),
-                    torch.tensor(Xb[0], dtype=torch.float32), 
-                    torch.tensor(label, dtype=torch.long)
-                ))
-                
-            except Exception as e:
-                print(f"Error loading {file_path}: {e}")
-                # Cache zero tensors as fallback
-                self.cached_data.append((
-                    torch.zeros((3, self.sequence_length, 33), dtype=torch.float32),
-                    torch.zeros((3, self.sequence_length, 33), dtype=torch.float32),
-                    torch.tensor(0, dtype=torch.long)
-                ))
-        
-        print(f"✅ Pre-loading complete! Cached {len(self.cached_data)} samples in memory.")
-        
-        # Report memory usage
-        import psutil
-        process = psutil.Process()
-        memory_gb = process.memory_info().rss / (1024 ** 3)
-        print(f"💾 Memory usage: {memory_gb:.2f} GB")
-
-    def __len__(self):
-        return len(self.cached_data)
-
-    def __getitem__(self, idx):
-        # Return pre-cached tensors directly
-        return self.cached_data[idx]
-
-class STGCNTrainer:
-    """Enhanced trainer for full ST-GCN model with advanced optimizations"""
-
-    def __init__(self, num_classes=10, learning_rate=0.001, batch_size=128, weight_decay=1e-4):
+    def __init__(self, num_classes=10, learning_rate=0.001, batch_size=32, weight_decay=1e-4, model_type="normal"):
         self.num_classes = num_classes
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.weight_decay = weight_decay
+        self.model_type = model_type
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        # Movement classes
+        # Movement classes (from PIM_MOVEMENTS)
         self.movement_classes = [
-            'ballistic', 'chorea', 'decerebrate', 'decorticate', 'dystonia',
-            'fencer posture', 'myoclonus', 'tremor', 'versive head'
+            'normal', 'decorticate', 'dystonia', 'chorea', 'myoclonus',
+            'decerebrate', 'fencer posture', 'ballistic', 'tremor', 'versive head'
         ]
 
         # Initialize model
-        self.edges = build_partitions()
-        self.model = STGCNTwoStream(num_classes, self.edges).to(self.device)
+        self.model = JointBoneEnsembleLSTM(input_dim=3, hidden_dim=128, num_layers=3, num_classes=num_classes) \
+                    if model_type == "joint_bone" else \
+                    PIMDetectorLSTM(input_dim=3, hidden_dim=128, num_layers=3, num_classes=num_classes)
+        self.model.to(self.device)
 
         # Enhanced optimizer (AdamW with weight decay)
         self.optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-        
-        # Learning rate scheduler with warmup and cosine decay
+
+        # Learning rate scheduler with cosine annealing
         self.scheduler = lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0=10, T_mult=2)
-        
+
         # Mixed precision scaler
         self.scaler = GradScaler()
 
@@ -128,7 +87,7 @@ class STGCNTrainer:
         # Loss function
         self.criterion = nn.CrossEntropyLoss()
 
-        print(f"🧠 Enhanced ST-GCN Model initialized on {self.device}")
+        print(f"🧠 Enhanced LSTM Model ({model_type}) initialized on {self.device}")
         print(f"📊 Number of classes: {num_classes}")
         print(f"🔧 Learning rate: {learning_rate}, Batch size: {batch_size}")
         print(f"⚖️  Weight decay: {weight_decay}")
@@ -141,18 +100,15 @@ class STGCNTrainer:
             print(f"🎮 GPU Memory: {gpu_memory:.1f} GB")
             print(f"🚀 Mixed precision training + enhanced optimizations enabled")
 
-    def load_all_data(self):
-        """Load ALL training data from the pose_data directory for comprehensive single model"""
-        print("📂 Loading ALL training data from pose_data directory...")
+    def load_all_data(self, data_dir=r"U:\pose_data"):
+        """Load ALL training data from the pose_data directory"""
+        print(f"📂 Loading ALL training data from {data_dir} directory...")
 
         all_files = []
         all_labels = []
 
-        # Load from pose_data directory - parse movement from filename
-        data_dir = r'U:\pose_data'
-
         if not os.path.exists(data_dir):
-            raise FileNotFoundError(f"pose_data directory not found at {data_dir}")
+            raise FileNotFoundError(f"Data directory not found at {data_dir}")
 
         # Get all CSV files
         csv_files = [f for f in os.listdir(data_dir) if f.endswith('_data.csv')]
@@ -178,7 +134,7 @@ class STGCNTrainer:
         print(f"📊 Total files loaded: {len(all_files)}")
 
         if len(all_files) == 0:
-            raise ValueError("No training files found! Check pose_data directory.")
+            raise ValueError(f"No training files found! Check {data_dir} directory.")
 
         # Split into train/val
         train_files, val_files, train_labels, val_labels = train_test_split(
@@ -187,17 +143,15 @@ class STGCNTrainer:
 
         print(f"🎯 Train: {len(train_files)} files, Val: {len(val_files)} files")
 
-        # Create datasets
-        train_dataset = PIMDataset(train_files, train_labels)
-        val_dataset = PIMDataset(val_files, val_labels)
+        # Create datasets (pre-cached loading)
+        train_dataset = PIMDatasetLSTM(train_files, train_labels, seq_length=30, overlap=10)
+        val_dataset = PIMDatasetLSTM(val_files, val_labels, seq_length=30, overlap=10)
 
         # Create data loaders (data is pre-cached, so minimal workers needed)
         train_loader = DataLoader(train_dataset, batch_size=self.batch_size,
-                                shuffle=True, num_workers=2, pin_memory=True,
-                                persistent_workers=True, prefetch_factor=4)
+                                shuffle=True, num_workers=0, pin_memory=True)
         val_loader = DataLoader(val_dataset, batch_size=self.batch_size,
-                              shuffle=False, num_workers=2, pin_memory=True,
-                              persistent_workers=True, prefetch_factor=4)
+                              shuffle=False, num_workers=0, pin_memory=True)
 
         return train_loader, val_loader
 
@@ -208,23 +162,23 @@ class STGCNTrainer:
         correct = 0
         total = 0
 
-        for batch_idx, (joints, bones, labels) in enumerate(train_loader):
-            joints, bones, labels = joints.to(self.device), bones.to(self.device), labels.to(self.device)
+        for batch_idx, (sequences, labels) in enumerate(train_loader):
+            sequences, labels = sequences.to(self.device), labels.to(self.device)
 
             self.optimizer.zero_grad()
 
             # Mixed precision forward pass
             with autocast():
-                outputs = self.model(joints, bones)
+                outputs, _ = self.model(sequences)
                 loss = self.criterion(outputs, labels)
 
             # Mixed precision backward pass with gradient clipping
             self.scaler.scale(loss).backward()
-            
+
             # Gradient clipping
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            
+
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
@@ -234,7 +188,7 @@ class STGCNTrainer:
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
 
-            if batch_idx % 5 == 0:  # Print more frequently
+            if batch_idx % 10 == 0:  # Print progress
                 current_lr = self.optimizer.param_groups[0]['lr']
                 print(f"  Batch {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f}, Acc: {100.*correct/total:.2f}%, LR: {current_lr:.6f}")
 
@@ -253,11 +207,11 @@ class STGCNTrainer:
         all_labels = []
 
         with torch.no_grad():
-            for joints, bones, labels in val_loader:
-                joints, bones, labels = joints.to(self.device), bones.to(self.device), labels.to(self.device)
+            for sequences, labels in val_loader:
+                sequences, labels = sequences.to(self.device), labels.to(self.device)
 
                 with autocast():
-                    outputs = self.model(joints, bones)
+                    outputs, _ = self.model(sequences)
                     loss = self.criterion(outputs, labels)
 
                 total_loss += loss.item()
@@ -274,13 +228,13 @@ class STGCNTrainer:
 
         return avg_loss, accuracy, f1
 
-    def train(self, num_epochs=100, save_path='models/stgcn_enhanced_model.pth'):
+    def train(self, num_epochs=100, save_path='models/lstm_enhanced_model.pth', data_dir="pose_data"):
         """Enhanced training loop with early stopping and scheduling"""
-        print("🚀 Starting Enhanced ST-GCN Training")
+        print("🚀 Starting Enhanced LSTM Training")
         print("=" * 60)
 
         # Load data
-        train_loader, val_loader = self.load_all_data()
+        train_loader, val_loader = self.load_all_data(data_dir)
 
         # Training history
         history = {
@@ -326,7 +280,8 @@ class STGCNTrainer:
                     'val_acc': val_acc,
                     'val_f1': val_f1,
                     'best_val_loss': self.best_val_loss,
-                    'classes': self.movement_classes
+                    'classes': self.movement_classes,
+                    'model_type': self.model_type
                 }, save_path)
                 print(f"💾 Saved best model (val_acc: {val_acc:.2f}%)")
                 self.early_stop_counter = 0  # Reset early stopping counter
@@ -348,37 +303,41 @@ class STGCNTrainer:
         checkpoint = torch.load(save_path)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         final_val_loss, final_val_acc, final_val_f1 = self.validate(val_loader)
-        print(f"📊 Final model - Val Loss: {final_val_loss:.4f}, Val Acc: {final_val_acc:.2f}%, Val F1: {final_val_f1:.4f}")
 
-        # Plot training history
-        self.plot_history(history)
+        print("📊 Final Model Performance:")
+        print(f"   Validation Loss: {final_val_loss:.4f}")
+        print(f"   Validation Accuracy: {final_val_acc:.2f}%")
+        print(f"   Validation F1 Score: {final_val_f1:.4f}")
 
         return history
 
-    def plot_history(self, history):
-        """Plot enhanced training history"""
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14, 10))
+    def plot_training_history(self, history):
+        """Plot comprehensive training history"""
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
 
-        # Loss
-        ax1.plot(history['train_loss'], label='Train')
-        ax1.plot(history['val_loss'], label='Validation')
-        ax1.set_title('Loss')
+        # Training and Validation Loss
+        ax1.plot(history['train_loss'], label='Train Loss', color='blue')
+        ax1.plot(history['val_loss'], label='Val Loss', color='red')
+        ax1.set_title('Training and Validation Loss')
         ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Loss')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
 
-        # Accuracy
-        ax2.plot(history['train_acc'], label='Train')
-        ax2.plot(history['val_acc'], label='Validation')
-        ax2.set_title('Accuracy (%)')
+        # Training and Validation Accuracy
+        ax2.plot(history['train_acc'], label='Train Acc', color='green')
+        ax2.plot(history['val_acc'], label='Val Acc', color='orange')
+        ax2.set_title('Training and Validation Accuracy')
         ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('Accuracy (%)')
         ax2.legend()
         ax2.grid(True, alpha=0.3)
 
         # F1 Score
-        ax3.plot(history['val_f1'], label='Validation F1', color='orange')
-        ax3.set_title('F1 Score')
+        ax3.plot(history['val_f1'], label='Val F1', color='purple')
+        ax3.set_title('Validation F1 Score')
         ax3.set_xlabel('Epoch')
+        ax3.set_ylabel('F1 Score')
         ax3.legend()
         ax3.grid(True, alpha=0.3)
 
@@ -392,21 +351,22 @@ class STGCNTrainer:
             ax4.grid(True, alpha=0.3)
 
         plt.tight_layout()
-        plt.savefig('stgcn_enhanced_training_history.png', dpi=300, bbox_inches='tight')
+        plt.savefig('lstm_enhanced_training_history.png', dpi=300, bbox_inches='tight')
         plt.show()
 
-    def save_model(self, path='models/stgcn_full_model.pth'):
+    def save_model(self, path='models/lstm_full_model.pth'):
         """Save the trained model"""
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save({
             'model_state_dict': self.model.state_dict(),
             'classes': self.movement_classes,
-            'edges': self.edges
+            'model_type': self.model_type
         }, path)
         print(f"💾 Model saved to {path}")
 
 if __name__ == "__main__":
-    # Train enhanced ST-GCN model
-    trainer = STGCNTrainer(num_classes=9, learning_rate=0.001, batch_size=128, weight_decay=1e-4)
-    history = trainer.train(num_epochs=100, save_path='models/stgcn_enhanced_model.pth')
-    trainer.save_model('models/stgcn_enhanced_model.pth')
+    # Train enhanced LSTM model
+    trainer = LSTMTrainer(num_classes=10, learning_rate=0.001, batch_size=32, weight_decay=1e-4, model_type="normal")
+    history = trainer.train(num_epochs=100, save_path='models/lstm_enhanced_model.pth', data_dir=r"U:\pose_data")
+    trainer.plot_training_history(history)
+    trainer.save_model('models/lstm_enhanced_model.pth')

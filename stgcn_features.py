@@ -36,7 +36,8 @@ def _bones_from_edges(seq_tvc, edges):
     # seq_tvc: [T,V,3]
     T, V, _ = seq_tvc.shape
     bones = np.zeros_like(seq_tvc)
-    parent = {v: u for (u, v) in edges} | {u: v for (u, v) in edges}  # bidirectional
+    parent = {v: u for (u, v) in edges}
+    parent.update({u: v for (u, v) in edges})  # bidirectional
     # pick a single parent closer to center: here choose the one with smaller index if unsure
     for u, v in edges:
         bones[:, v, :] = seq_tvc[:, v, :] - seq_tvc[:, u, :]
