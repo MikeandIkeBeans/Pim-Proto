@@ -155,7 +155,8 @@ class MockModel:
 
 class AnnotatedVideoGenerator:
     def __init__(self, model_path=None, 
-                 confidence_threshold=0.7, sequence_length=30, use_ensemble=False):
+                 confidence_threshold=0.7, sequence_length=30, use_ensemble=False,
+                 ensemble_models=None):
         """
         Initialize the annotated video generator
         
@@ -164,16 +165,18 @@ class AnnotatedVideoGenerator:
             confidence_threshold: Minimum confidence for detection
             sequence_length: Number of frames for temporal analysis
             use_ensemble: Whether to use ensemble voting instead of single model
+            ensemble_models: List of model names to use in ensemble (e.g., ['stgcn_full', 'joint_bone'])
         """
         self.confidence_threshold = confidence_threshold
         self.sequence_length = sequence_length
         self.use_ensemble = use_ensemble
+        self.ensemble_models = ensemble_models  # List of model names to use
         
         # Load the trained model(s)
         print(f"Loading model from: {model_path if model_path else 'ensemble mode'}")
         if MEDIAPIPE_AVAILABLE:
             if use_ensemble:
-                self.model, self.movements, self.model_type = self._load_ensemble_models()
+                self.model, self.movements, self.model_type = self._load_ensemble_models(self.ensemble_models)
             else:
                 if model_path is None:
                     raise ValueError("model_path must be provided when use_ensemble=False")
@@ -226,8 +229,13 @@ class AnnotatedVideoGenerator:
         else:
             self.processor = MockMultiViewPIMProcessor(num_views=3)
     
-    def _load_ensemble_models(self, config_path=None):
-        """Load ensemble models for voting - comprehensive ensemble like model_comparison_demo"""
+    def _load_ensemble_models(self, model_names=None):
+        """Load ensemble models for voting - supports custom model combinations
+        
+        Args:
+            model_names: List of model names to load (e.g., ['stgcn_full', 'joint_bone'])
+                        If None, loads all available models
+        """
         from concurrent.futures import ThreadPoolExecutor
         import torch
         
@@ -260,8 +268,27 @@ class AnnotatedVideoGenerator:
             'stgcn_full': {
                 'path': 'models/stgcn_full_comprehensive.pth',
                 'description': 'ST-GCN Full Comprehensive Model (All Data)'
+            },
+            'stgcn_enhanced': {
+                'path': 'models/stgcn_enhanced_model.pth',
+                'description': 'ST-GCN Enhanced Model (Fresh Training)'
             }
         }
+        
+        # If specific models requested, filter the configs
+        if model_names is not None:
+            requested_configs = {}
+            for name in model_names:
+                if name in model_configs:
+                    requested_configs[name] = model_configs[name]
+                else:
+                    print(f"⚠️  Model '{name}' not found in available models")
+            model_configs = requested_configs
+            
+            if not model_configs:
+                raise ValueError(f"No valid models found in: {model_names}")
+        
+        print(f"Loading ensemble with models: {list(model_configs.keys())}")
         
         ensemble_models = []
         ensemble_movements = None
@@ -787,7 +814,30 @@ class AnnotatedVideoGenerator:
                     annotated_frame = self.draw_pose_skeleton(annotated_frame, landmarks)
                 
                 # Write frame to output video
-                out.write(annotated_frame)
+                try:
+                    out.write(annotated_frame)
+                except cv2.error as e:
+                    if "Insufficient memory" in str(e):
+                        print(f"⚠️  Memory error during video writing: {e}")
+                        print("🧹 Attempting emergency memory cleanup...")
+                        import gc
+                        for _ in range(5):
+                            gc.collect()
+                        # Try writing again
+                        try:
+                            out.write(annotated_frame)
+                            print("✅ Frame written after cleanup")
+                        except cv2.error:
+                            print("❌ Failed to write frame even after cleanup - skipping frame")
+                            continue
+                    else:
+                        raise  # Re-raise if it's not a memory error
+                
+                # Explicit cleanup of frame data to prevent memory accumulation
+                del annotated_frame
+                del cropped_frame
+                if pose_detected:
+                    del landmarks
                 
                 frame_count += 1
                 processed_frames += 1
@@ -800,10 +850,12 @@ class AnnotatedVideoGenerator:
                     print(f"Progress: {progress:.1f}% ({processed_frames}/{processing_frames} frames) "
                           f"- ETA: {remaining:.0f}s")
 
-                    # Memory management: periodic cleanup every 1000 frames
-                    if processed_frames % 1000 == 0:
+                    # Memory management: more frequent cleanup for long videos
+                    if processed_frames % 500 == 0:  # Every 500 frames instead of 1000
                         import gc
-                        gc.collect()
+                        # Force garbage collection multiple times
+                        for _ in range(3):
+                            gc.collect()
                         print(f"🧹 Memory cleanup performed")
         
         finally:
@@ -1077,16 +1129,60 @@ if __name__ == "__main__":
             model_path=None,  # Not used for ensemble mode
             confidence_threshold=0.7,
             sequence_length=30,
-            use_ensemble=True
+            use_ensemble=True,
+            ensemble_models=['stgcn_enhanced', 'joint_bone']  # Custom ensemble: Enhanced ST-GCN + Joint-Bone LSTM
         )
         
-        output_path = generator.generate_annotated_video(
-            input_video_path=input_video,
-            max_duration=60,  # Process only first 60 seconds for testing
-            start_time=0
-        )
-        
-        print(f"\n✅ Success! Annotated video saved to: {output_path}")
+        # For very long videos, process in chunks to avoid memory issues
+        import os
+        if os.path.exists(input_video):
+            cap = cv2.VideoCapture(input_video)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            cap.release()
+            
+            duration = total_frames / fps if fps > 0 else 0
+            print(f"Video duration: {duration:.1f}s ({total_frames} frames)")
+            
+            # If video is very long (>30 minutes), suggest chunked processing
+            if duration > 1800:  # 30 minutes
+                print("⚠️  Long video detected. Consider processing in chunks to avoid memory issues.")
+                chunk_duration = 900  # 15 minutes per chunk
+                
+                chunk_outputs = []
+                for chunk_idx, start_time in enumerate(range(0, int(duration), chunk_duration)):
+                    chunk_end = min(start_time + chunk_duration, duration)
+                    print(f"\n🎬 Processing chunk {chunk_idx + 1}: {start_time}s to {chunk_end}s")
+                    
+                    # Create unique output filename for each chunk
+                    base_name = os.path.splitext(os.path.basename(input_video))[0]
+                    chunk_output = f"annotated_{base_name}_chunk{chunk_idx + 1:02d}.mp4"
+                    
+                    output_path = generator.generate_annotated_video(
+                        input_video_path=input_video,
+                        output_video_path=chunk_output,
+                        max_duration=chunk_duration,
+                        start_time=start_time
+                    )
+                    chunk_outputs.append(output_path)
+                    print(f"✅ Chunk {chunk_idx + 1} saved: {output_path}")
+                
+                print(f"\n✅ All {len(chunk_outputs)} chunks processed!")
+                print("📋 Chunk files:")
+                for i, chunk_path in enumerate(chunk_outputs, 1):
+                    print(f"  {i}. {chunk_path}")
+                print("\n💡 To combine chunks: Use video editing software or ffmpeg:")
+                print(f"   ffmpeg -f concat -safe 0 -i <(for f in {' '.join(chunk_outputs)}; do echo \"file '$PWD/$f'\"; done) -c copy combined_{base_name}.mp4")
+            else:
+                # Process normally for shorter videos
+                output_path = generator.generate_annotated_video(
+                    input_video_path=input_video,
+                    start_time=0
+                )
+                
+                print(f"\n✅ Success! Annotated video saved to: {output_path}")
+        else:
+            print(f"❌ Input video not found: {input_video}")
         
     except Exception as e:
         print(f"❌ Error: {e}")

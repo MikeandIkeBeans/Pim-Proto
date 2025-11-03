@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Model Comparison Demo - Test Multiple PIM Detection Models
 Allows switching between different model architectures for comparison
@@ -15,6 +16,11 @@ import os
 import argparse
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Force UTF-8 encoding for Windows console
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
 
 # Add current directory to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -56,7 +62,10 @@ class ModelComparisonDemo:
                 
                 # Special handling for comprehensive ST-GCN model
                 if name == 'stgcn_full':
-                    checkpoint = torch.load(config['path'])
+                    try:
+                        checkpoint = torch.load(config['path'], map_location='cpu')
+                    except Exception:
+                        checkpoint = torch.load(config['path'], map_location='cpu', weights_only=False)
                     
                     movements = checkpoint['classes']
                     
@@ -88,6 +97,46 @@ class ModelComparisonDemo:
                     print(f"   Classes: {movements}")
                     continue
                 
+                # Special handling for enhanced ST-GCN model
+                if name == 'stgcn_enhanced':
+                    try:
+                        checkpoint = torch.load(config['path'], map_location='cpu')
+                    except Exception:
+                        checkpoint = torch.load(config['path'], map_location='cpu', weights_only=False)
+                    
+                    movements = checkpoint['classes']
+                    
+                    from stgcn_model import STGCNTwoStreamEnhanced
+                    from stgcn_graph import build_partitions
+                    A = build_partitions()
+                    
+                    # Use the enhanced architecture that matches the checkpoint
+                    model = STGCNTwoStreamEnhanced(num_classes=len(movements), A=A)
+                    
+                    # Handle different checkpoint formats
+                    if 'model_state_dict' in checkpoint:
+                        model.load_state_dict(checkpoint['model_state_dict'])
+                    elif 'state_dict' in checkpoint:
+                        model.load_state_dict(checkpoint['state_dict'])
+                    else:
+                        raise KeyError("Checkpoint missing state_dict or model_state_dict")
+                    
+                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                    model.to(device)
+                    model.eval()
+                    
+                    self.models[name] = {
+                        'model': model,
+                        'movements': movements,
+                        'model_type': 'stgcntwostreamenhanced',
+                        'device': device
+                    }
+                    self.model_info[name] = config
+                    
+                    print(f"✅ {name}: stgcntwostream enhanced model loaded")
+                    print(f"   Classes: {movements}")
+                    continue
+                
                 # Special handling for ensemble mode
                 if name == 'ensemble':
                     # Load all ensemble models for voting
@@ -99,7 +148,10 @@ class ModelComparisonDemo:
                         ensemble_name = f'ensemble_{i}'
                         if ensemble_name in model_configs:
                             ensemble_config = model_configs[ensemble_name]
-                            checkpoint = torch.load(ensemble_config['path'])
+                            try:
+                                checkpoint = torch.load(ensemble_config['path'], map_location='cpu')
+                            except Exception:
+                                checkpoint = torch.load(ensemble_config['path'], map_location='cpu', weights_only=False)
                             
                             movements = checkpoint['classes']
                             if ensemble_movements is None:
@@ -144,7 +196,10 @@ class ModelComparisonDemo:
                         stgcn_name = f'stgcn_{i}'
                         if stgcn_name in model_configs:
                             stgcn_config = model_configs[stgcn_name]
-                            checkpoint = torch.load(stgcn_config['path'])
+                            try:
+                                checkpoint = torch.load(stgcn_config['path'], map_location='cpu')
+                            except Exception:
+                                checkpoint = torch.load(stgcn_config['path'], map_location='cpu', weights_only=False)
                             
                             movements = checkpoint['classes']
                             
@@ -169,7 +224,10 @@ class ModelComparisonDemo:
                         stgcn_name = f'stgcn_{i}'
                         if stgcn_name in model_configs:
                             stgcn_config = model_configs[stgcn_name]
-                            checkpoint = torch.load(stgcn_config['path'])
+                            try:
+                                checkpoint = torch.load(stgcn_config['path'], map_location='cpu')
+                            except Exception:
+                                checkpoint = torch.load(stgcn_config['path'], map_location='cpu', weights_only=False)
                             
                             movements = checkpoint['classes']
                             if ensemble_movements is None:
@@ -194,7 +252,10 @@ class ModelComparisonDemo:
                     # Load comprehensive ST-GCN model
                     if 'stgcn_full' in model_configs:
                         stgcn_config = model_configs['stgcn_full']
-                        checkpoint = torch.load(stgcn_config['path'])
+                        try:
+                            checkpoint = torch.load(stgcn_config['path'], map_location='cpu')
+                        except Exception:
+                            checkpoint = torch.load(stgcn_config['path'], map_location='cpu', weights_only=False)
                         
                         movements = checkpoint['classes']
                         if ensemble_movements is None:
@@ -233,8 +294,46 @@ class ModelComparisonDemo:
                     print(f"   Classes: {ensemble_movements}")
                     continue
                 
+                # Special handling for lstm_checkpoint1 (has 10 classes with mismatched metadata)
+                if name == 'lstm_checkpoint1':
+                    try:
+                        checkpoint = torch.load(config['path'], map_location='cpu')
+                    except Exception:
+                        checkpoint = torch.load(config['path'], map_location='cpu', weights_only=False)
+                    
+                    # Get actual number of classes from the state_dict
+                    num_classes = checkpoint['model_state_dict']['classifier.weight'].shape[0]
+                    
+                    # Create proper movements list with 10 classes (includes normal)
+                    movements = ['normal', 'decorticate', 'dystonia', 'chorea', 'myoclonus', 
+                                'decerebrate', 'fencer posture', 'ballistic', 'tremor', 'versive head']
+                    
+                    from mediapipe_processor import PIMDetectorLSTM
+                    model = PIMDetectorLSTM(num_classes=num_classes)
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                    
+                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                    model.to(device)
+                    model.eval()
+                    
+                    self.models[name] = {
+                        'model': model,
+                        'movements': movements,
+                        'model_type': 'pimlstm',
+                        'device': device
+                    }
+                    self.model_info[name] = config
+                    
+                    print(f"✅ {name}: PIM LSTM model loaded (10 classes)")
+                    print(f"   Classes: {movements}")
+                    continue
+                
                 # Regular model loading
-                checkpoint = torch.load(config['path'])
+                try:
+                    checkpoint = torch.load(config['path'], map_location='cpu')
+                except Exception:
+                    # Try loading with weights_only=False for older PyTorch versions
+                    checkpoint = torch.load(config['path'], map_location='cpu', weights_only=False)
 
                 # Handle different model save formats
                 if 'state_dict' in checkpoint:
@@ -508,10 +607,10 @@ class ModelComparisonDemo:
             print(f"  {status} {name}: {info['description']}")
         print(f"\nActive model: {self.active_model}")
         print("Controls:")
-        print("  '1': joint_bone | '2': ensemble_0 | '3': ensemble_1 | '4': ensemble_2")
-        print("  '5': stgcn_0    | '6': stgcn_1    | '8': stgcn_full")
-        print("  '7': ENSEMBLE VOTING")
-        print("  Note: Ensemble uses 7 models (includes joint_bone + stgcn_full)")
+        print("  '1': joint_bone - Joint-Bone Ensemble LSTM (Original)")
+        print("  '2': lstm_enhanced - LSTM Enhanced Model")
+        print("  '3': stgcn_enhanced - ST-GCN Enhanced Model")
+        print("  '4': lstm_weights - LSTM Enhanced Weights")
         print("  'q': Quit")
         print("=" * 50)
 
@@ -586,13 +685,9 @@ class ModelComparisonDemo:
                         
                         model_keys = {
                             '1': 'joint_bone',
-                            '2': 'ensemble_0', 
-                            '3': 'ensemble_1',
-                            '4': 'ensemble_2',
-                            '5': 'stgcn_0',
-                            '6': 'stgcn_1',
-                            '7': 'ensemble',
-                            '8': 'stgcn_full'
+                            '2': 'lstm_enhanced',
+                            '3': 'stgcn_enhanced', 
+                            '4': 'lstm_weights'
                         }
                         
                         for key, model_name in model_keys.items():
@@ -629,23 +724,15 @@ class ModelComparisonDemo:
                 if key != 255:  # 255 is no key pressed
                     print(f"Key pressed: {key} (ord('7')={ord('7')})")
 
-                # Model switching keys
+                # Model switching keys - linked to configs
                 if key == ord('1') and 'joint_bone' in self.models:
                     self.switch_model('joint_bone')
-                elif key == ord('2') and 'ensemble_0' in self.models:
-                    self.switch_model('ensemble_0')
-                elif key == ord('3') and 'ensemble_1' in self.models:
-                    self.switch_model('ensemble_1')
-                elif key == ord('4') and 'ensemble_2' in self.models:
-                    self.switch_model('ensemble_2')
-                elif key == ord('5') and 'stgcn_0' in self.models:
-                    self.switch_model('stgcn_0')
-                elif key == ord('6') and 'stgcn_1' in self.models:
-                    self.switch_model('stgcn_1')
-                elif key == ord('8') and 'stgcn_full' in self.models:
-                    self.switch_model('stgcn_full')
-                elif key == ord('7') and 'ensemble' in self.models:
-                    self.switch_model('ensemble')
+                elif key == ord('2') and 'lstm_enhanced' in self.models:
+                    self.switch_model('lstm_enhanced')
+                elif key == ord('3') and 'stgcn_enhanced' in self.models:
+                    self.switch_model('stgcn_enhanced')
+                elif key == ord('4') and 'lstm_weights' in self.models:
+                    self.switch_model('lstm_weights')
                 elif key == ord('q'):
                     break
 
@@ -657,40 +744,28 @@ class ModelComparisonDemo:
             print("✅ Demo ended")
 
 def main():
-    # Define available models
+    # Define available models - LSTM comparison setup
+    # Note: Only including models that are compatible with the current loading infrastructure
     model_configs = {
         'joint_bone': {
             'path': 'models/pim_model_joint_bone.pth',
-            'description': 'Joint-Bone Ensemble LSTM (Advanced)'
+            'description': 'Joint-Bone Ensemble LSTM (Original)'
         },
-        'ensemble_0': {
-            'path': 'models/ensemble/ensemble_model_0.pth',
-            'description': 'Ensemble Model 0'
+        'lstm_enhanced': {
+            'path': 'models/lstm_enhanced_model.pth',
+            'description': 'LSTM Enhanced Model'
         },
-        'ensemble_1': {
-            'path': 'models/ensemble/ensemble_model_1.pth',
-            'description': 'Ensemble Model 1'
+        'stgcn_enhanced': {
+            'path': 'models/stgcn_enhanced_model.pth',
+            'description': 'ST-GCN Enhanced Model'
         },
-        'ensemble_2': {
-            'path': 'models/ensemble/ensemble_model_2.pth',
-            'description': 'Ensemble Model 2'
-        },
-        'stgcn_0': {
-            'path': 'models/ensemble/ensemble_model_stgcn_0.pth',
-            'description': 'ST-GCN Ensemble Model 0'
-        },
-        'stgcn_1': {
-            'path': 'models/ensemble/ensemble_model_stgcn_1.pth',
-            'description': 'ST-GCN Ensemble Model 1'
-        },
-        'stgcn_full': {
-            'path': 'models/stgcn_full_comprehensive.pth',
-            'description': 'ST-GCN Full Comprehensive Model (All Data)'
-        },
-        'ensemble': {
-            'path': 'ensemble_voting',  # Special marker for ensemble mode
-            'description': 'Combined Ensemble Voting (All Models)'
+        'lstm_weights': {
+            'path': 'models/lstm_enhanced_weights.pth',
+            'description': 'LSTM Enhanced Weights'
         }
+        # Note: The following models are excluded due to incompatibility:
+        # - pim_unik_bone/joint: Different architecture format (missing metadata keys)
+        # - stgcn_full: Architecture mismatch (different layer dimensions)
     }
 
     demo = ModelComparisonDemo(model_configs)
