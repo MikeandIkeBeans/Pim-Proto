@@ -10,6 +10,7 @@ import json
 import time
 import sys
 import threading
+import queue
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from collections import deque, Counter
@@ -80,11 +81,12 @@ DEFAULT_SIGNALING_URL = os.getenv(
 class DetectionStorage:
     """
     Handles storing AI detection predictions to the database.
+    Uses a background thread with a queue for non-blocking writes.
     Throttles storage to avoid database overload (default: every 2 seconds).
     """
     
     def __init__(self, session_id: str, camera_id: str, room_id: Optional[str],
-                 model_name: str, store_interval: float = 2.0):
+                 model_name: str, store_interval: float = 5.0):
         self.enabled = DATABASE_AVAILABLE
         if not self.enabled:
             LOGGER.warning("📊 Database not available - predictions will not be stored")
@@ -98,7 +100,70 @@ class DetectionStorage:
         self.last_store_time = 0
         self.sequence_number = 0
         
-        LOGGER.info(f"📊 Database storage initialized (interval={store_interval}s)")
+        # Queue for non-blocking database writes
+        self._write_queue = queue.Queue(maxsize=100)  # Limit queue size to prevent memory issues
+        self._shutdown = threading.Event()
+        self._writer_thread = threading.Thread(target=self._db_writer_loop, daemon=True, name="db_writer")
+        self._writer_thread.start()
+        
+        LOGGER.info(f"📊 Database storage initialized (interval={store_interval}s, async writes enabled)")
+    
+    def _db_writer_loop(self):
+        """Background thread that writes detections to database from queue."""
+        while not self._shutdown.is_set():
+            try:
+                # Wait for item with timeout so we can check shutdown flag
+                try:
+                    item = self._write_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                
+                # Process the write request
+                if item is None:  # Shutdown signal
+                    break
+                
+                try:
+                    supabase.table('ai_detections').insert(item).execute()
+                except Exception as e:
+                    LOGGER.error(f"❌ DB write failed: {e}")
+                finally:
+                    self._write_queue.task_done()
+                    
+            except Exception as e:
+                LOGGER.error(f"❌ DB writer error: {e}")
+        
+        # Drain remaining items on shutdown
+        while not self._write_queue.empty():
+            try:
+                item = self._write_queue.get_nowait()
+                if item is not None:
+                    try:
+                        supabase.table('ai_detections').insert(item).execute()
+                    except Exception as e:
+                        LOGGER.error(f"❌ DB write failed during shutdown: {e}")
+                self._write_queue.task_done()
+            except queue.Empty:
+                break
+        
+        LOGGER.info("🧹 DB writer thread shutdown complete")
+    
+    def shutdown(self):
+        """Gracefully shutdown the writer thread."""
+        if not self.enabled:
+            return
+        
+        LOGGER.info("📊 Shutting down DB writer (draining queue)...")
+        self._shutdown.set()
+        
+        # Wait for queue to drain (with timeout)
+        try:
+            self._write_queue.put(None, timeout=1.0)  # Send shutdown signal
+        except queue.Full:
+            pass
+        
+        self._writer_thread.join(timeout=10.0)
+        if self._writer_thread.is_alive():
+            LOGGER.warning("⚠️ DB writer thread did not shutdown cleanly")
     
     def should_store(self) -> bool:
         """Check if enough time has elapsed since last storage."""
@@ -115,85 +180,76 @@ class DetectionStorage:
                        all_probs: dict, temperature: float = 1.0,
                        frame_count: int = 120, processing_time_ms: int = 0,
                        pose_landmarks: list = None):
-        """Store a single detection to the database with optional pose landmarks."""
+        """Queue a detection for async storage to database."""
         if not self.enabled:
             return
         
+        self.sequence_number += 1
+        
+        detection_data = {
+            'all_probabilities': all_probs,
+            'temperature': temperature,
+            'frame_count': frame_count,
+            'model_architecture': 'PoseTCN-SingleView'
+        }
+        
+        # Add pose landmarks if provided (for skeleton replay during playback)
+        if pose_landmarks:
+            detection_data['pose_landmarks'] = pose_landmarks
+        
+        record = {
+            'session_id': self.session_id,
+            'camera_id': self.camera_id,
+            'room_id': self.room_id,
+            'detection_type': predicted_class,
+            'confidence_score': confidence,
+            'detection_data': detection_data,
+            'frame_timestamp': datetime.now(timezone.utc).isoformat(),
+            'sequence_number': self.sequence_number,
+            'model_used': self.model_name,
+            'processing_time_ms': processing_time_ms,
+            'processed_on': 'edge'
+        }
+        
+        # Non-blocking queue put - drop if queue is full
         try:
-            self.sequence_number += 1
-            
-            detection_data = {
-                'all_probabilities': all_probs,
-                'temperature': temperature,
-                'frame_count': frame_count,
-                'model_architecture': 'PoseTCN-SingleView'
-            }
-            
-            # Add pose landmarks if provided (for skeleton replay during playback)
-            if pose_landmarks:
-                detection_data['pose_landmarks'] = pose_landmarks
-            
-            supabase.table('ai_detections').insert({
-                'session_id': self.session_id,
-                'camera_id': self.camera_id,
-                'room_id': self.room_id,
-                'detection_type': predicted_class,
-                'confidence_score': confidence,
-                'detection_data': detection_data,
-                # ⬇️ UPDATED: timezone-aware UTC timestamp
-                'frame_timestamp': datetime.now(timezone.utc).isoformat(),
-                'sequence_number': self.sequence_number,
-                'model_used': self.model_name,
-                'processing_time_ms': processing_time_ms,
-                'processed_on': 'edge'
-            }).execute()
-            
-            if db_logger:
-                db_logger.info(f"✅ Stored detection #{self.sequence_number}: {predicted_class} ({confidence:.2%})")
-            
-        except Exception as e:
-            if db_logger:
-                db_logger.error(f"Failed to store detection: {e}")
-            else:
-                LOGGER.error(f"❌ Failed to store detection: {e}")
+            self._write_queue.put_nowait(record)
+        except queue.Full:
+            LOGGER.warning("⚠️ DB write queue full - dropping detection")
     
     def store_batch_summary(self, detection_counts: dict, avg_confidence: float,
                            total_frames: int, duration_seconds: float):
-        """Store a summary of detection session."""
+        """Queue a session summary for async storage."""
         if not self.enabled:
             return
         
+        summary_data = {
+            'detection_counts': detection_counts,
+            'avg_confidence': avg_confidence,
+            'total_frames': total_frames,
+            'duration_seconds': duration_seconds,
+            'detections_per_second': self.sequence_number / duration_seconds if duration_seconds > 0 else 0
+        }
+        
+        record = {
+            'session_id': self.session_id,
+            'camera_id': self.camera_id,
+            'room_id': self.room_id,
+            'detection_type': 'session_summary',
+            'confidence_score': avg_confidence,
+            'detection_data': summary_data,
+            'frame_timestamp': datetime.now(timezone.utc).isoformat(),
+            'sequence_number': self.sequence_number,
+            'model_used': self.model_name,
+            'processed_on': 'edge'
+        }
+        
+        # For summary, wait briefly since it's end of session
         try:
-            summary_data = {
-                'detection_counts': detection_counts,
-                'avg_confidence': avg_confidence,
-                'total_frames': total_frames,
-                'duration_seconds': duration_seconds,
-                'detections_per_second': self.sequence_number / duration_seconds if duration_seconds > 0 else 0
-            }
-            
-            supabase.table('ai_detections').insert({
-                'session_id': self.session_id,
-                'camera_id': self.camera_id,
-                'room_id': self.room_id,
-                'detection_type': 'session_summary',
-                'confidence_score': avg_confidence,
-                'detection_data': summary_data,
-                # ⬇️ UPDATED: timezone-aware UTC timestamp
-                'frame_timestamp': datetime.now(timezone.utc).isoformat(),
-                'sequence_number': self.sequence_number,
-                'model_used': self.model_name,
-                'processed_on': 'edge'
-            }).execute()
-            
-            if db_logger:
-                db_logger.info(f"✅ Stored session summary: {len(detection_counts)} unique detections")
-            
-        except Exception as e:
-            if db_logger:
-                db_logger.error(f"Failed to store session summary: {e}")
-            else:
-                LOGGER.error(f"❌ Failed to store summary: {e}")
+            self._write_queue.put(record, timeout=5.0)
+            LOGGER.info(f"✅ Queued session summary: {len(detection_counts)} unique detections")
+        except queue.Full:
+            LOGGER.error("❌ Failed to queue session summary - queue full")
 
 
 def detect_video_devices() -> List[Tuple[str, str]]:
@@ -535,6 +591,13 @@ class MediaPipePoseProcessor:
         self.all_confidences = []
         self.stream_start_time = time.time()
         
+        # Performance monitoring
+        self._last_perf_log = time.time()
+        self._perf_log_interval = 60  # Log stats every 60 seconds
+        self._frames_since_last_log = 0
+        self._ai_process_times = deque(maxlen=100)  # Track last 100 AI processing times
+        self._dropped_frames = 0  # Frames where AI was still busy
+        
         if enable_classifier:
             try:
                 checkpoint_path = Path(__file__).parent.parent / "ai_models" / "best_single_view_f1_bn_t120_gamma175.pt"
@@ -638,6 +701,20 @@ class MediaPipePoseProcessor:
             - prediction: Dict with classification results or None
         """
         self.frame_count += 1
+        self._frames_since_last_log += 1
+        
+        # Periodic performance logging
+        now = time.time()
+        if now - self._last_perf_log >= self._perf_log_interval:
+            fps = self._frames_since_last_log / (now - self._last_perf_log)
+            avg_ai_time = sum(self._ai_process_times) / len(self._ai_process_times) if self._ai_process_times else 0
+            queue_size = self.storage._write_queue.qsize() if self.storage and hasattr(self.storage, '_write_queue') else 0
+            LOGGER.info(
+                "📈 [PERF] FPS: %.1f | AI avg: %.0fms | DB queue: %d | Dropped: %d | Total frames: %d",
+                fps, avg_ai_time * 1000, queue_size, self._dropped_frames, self.frame_count
+            )
+            self._last_perf_log = now
+            self._frames_since_last_log = 0
         
         # Only process every Nth frame to reduce CPU load
         if self.frame_count % self.process_every_n_frames != 0:
@@ -662,6 +739,9 @@ class MediaPipePoseProcessor:
                     )
             except Exception as e:
                 LOGGER.error("❌ Error converting frame: %s", e)
+        else:
+            # AI is still processing previous frame - we're falling behind
+            self._dropped_frames += 1
         
         # Return last known results immediately (non-blocking)
         with self._lock:
@@ -674,6 +754,8 @@ class MediaPipePoseProcessor:
                 result = self._pending_future.result(timeout=0)
                 if result:
                     landmarks, prediction, infer_time_ms = result
+                    # Track AI processing time
+                    self._ai_process_times.append(infer_time_ms / 1000.0)  # Convert to seconds
                     with self._lock:
                         if landmarks is not None:
                             self.last_landmarks = landmarks
@@ -859,6 +941,9 @@ class MediaPipePoseProcessor:
                 LOGGER.info(f"  {cls}: {count} ({percentage:.1f}%)")
             LOGGER.info(f"\nAverage confidence: {avg_confidence:.2%}")
             LOGGER.info("✅ Session summary stored to database\n")
+            
+            # Shutdown DB writer thread (waits for queue to drain)
+            self.storage.shutdown()
         
         if self.pose:
             self.pose.close()
